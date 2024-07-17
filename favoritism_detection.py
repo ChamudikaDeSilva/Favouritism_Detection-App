@@ -1,47 +1,86 @@
+import logging
+import json
 import pandas as pd
-import mysql.connector
+import numpy as np
+from sqlalchemy import create_engine
 from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Connect to the database
-conn = mysql.connector.connect(
-    host="your_host",
-    user="your_user",
-    password="your_password",
-    database="your_database"
-)
+DATABASE_USERNAME = 'root'
+DATABASE_PASSWORD = ''
+DATABASE_HOST = 'localhost'
+DATABASE_NAME = 'student_management'
 
-# Query to get marks data
-query = """
-SELECT m.student_id, m.subject_id, m.teacher_id, m.mark, s.name as student_name, sub.name as subject_name, t.name as teacher_name
-FROM marks m
-JOIN students s ON m.student_id = s.id
-JOIN subjects sub ON m.subject_id = sub.id
-JOIN teachers t ON m.teacher_id = t.id;
-"""
+engine = create_engine(f'mysql+pymysql://{DATABASE_USERNAME}:{DATABASE_PASSWORD}@{DATABASE_HOST}/{DATABASE_NAME}')
 
-# Load data into a DataFrame
-df = pd.read_sql(query, conn)
-conn.close()
+# Load data
+marks = pd.read_sql('SELECT * FROM marks', engine)
 
-# Feature engineering
-df['avg_mark'] = df.groupby('student_id')['mark'].transform('mean')
-df['std_mark'] = df.groupby('student_id')['mark'].transform('std')
-df['teacher_avg_mark'] = df.groupby(['teacher_id', 'student_id'])['mark'].transform('mean')
+# Calculate average marks for each student
+student_avg_marks = marks.groupby('student_id')['marks'].mean().reset_index()
 
-# Selecting features
-features = df[['avg_mark', 'std_mark', 'teacher_avg_mark']]
+# Merge average marks with original data
+marks = marks.merge(student_avg_marks, on='student_id', suffixes=('_original', '_avg'))
 
-# Standardize features
-scaler = StandardScaler()
-features_scaled = scaler.fit_transform(features)
+# Calculate deviation from average for each mark
+marks['deviation'] = marks['marks_original'] - marks['marks_avg']
 
-# Train the Isolation Forest model
-model = IsolationForest(contamination=0.1)  # Adjust contamination parameter as needed
-model.fit(features_scaled)
+# Log average marks calculation
+logging.debug("Average Marks Calculation:")
+logging.debug(student_avg_marks.head())
 
-# Predict anomalies
-df['anomaly'] = model.predict(features_scaled)
+# Log merged data
+logging.debug("\nMerged Data with Average Marks and Deviation:")
+logging.debug(marks.head())
 
-# Save results to a CSV file
-df.to_csv('favoritism_detection_results.csv', index=False)
+# Use Isolation Forest for anomaly detection
+def detect_anomalies(df):
+    X = df[['deviation']]
+
+    # Convert average marks to integer for random_state
+    df['random_state'] = df['marks_avg'].apply(lambda x: hash(x) % (2**32))
+
+    # Log isolation forest input
+    logging.debug("\nIsolation Forest Input (X):")
+    logging.debug(X.head())
+
+    logging.debug("\nRandom State Values:")
+    logging.debug(df['random_state'].head())
+
+    # Initialize Isolation Forest model
+    isolation_forest = IsolationForest(contamination=0.1, random_state=df['random_state'].iloc[0])
+
+    # Fit model and predict anomalies
+    anomalies = isolation_forest.fit_predict(X)
+
+    # Log anomalies detected
+    logging.debug("\nAnomalies Detected:")
+    logging.debug(anomalies)
+
+    # Get indices of anomalies
+    anomaly_indices = np.where(anomalies == -1)[0]
+
+    # Get corresponding student_ids, subject_ids, marks_original, id, and teacher_id
+    anomalous_students = df.iloc[anomaly_indices][['id', 'student_id', 'subject_id', 'marks_original', 'teacher_id']]
+
+    return anomalous_students
+
+anomalous_students = detect_anomalies(marks)
+
+# Log number of anomalies found
+logging.debug(f"\nNumber of anomalies found: {len(anomalous_students)}")
+
+# Log anomalous students details
+logging.debug("Anomalous Students Details:")
+logging.debug(anomalous_students.head())
+
+# Output anomalous students as JSON
+anomalous_students_json = anomalous_students.to_json(orient='records')
+logging.debug("Anomalous Students JSON Output:")
+logging.debug(anomalous_students_json)
+
+# Print JSON output for verification
+print(anomalous_students_json)  
